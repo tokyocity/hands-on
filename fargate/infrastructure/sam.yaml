@@ -406,7 +406,7 @@ Resources:
   VPC:
     Type: AWS::EC2::VPC
     Properties:
-      CidrBlock: 10.0.0.0/16
+      CidrBlock: 10.1.0.0/16
       EnableDnsSupport: true
       EnableDnsHostnames: true
       Tags:
@@ -500,7 +500,7 @@ Resources:
       GroupDescription: SecurityGroup for internal access
       VpcId: !Ref VPC
       SecurityGroupIngress:
-        - CidrIp: 10.0.0.0/16
+        - CidrIp: 10.1.0.0/16
           IpProtocol: -1
       Tags:
         - Key: Name
