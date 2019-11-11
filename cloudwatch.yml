@@ -1,0 +1,146 @@
+attachmentFile /tmp/ppp-alert-message.txt
+mailRecipient デコード
+mailSender デコード
+title ppp-alert
+----------------------------------------------
+import os
+import boto3
+import json
+import logging
+import os
+import datetime
+import calendar
+from botocore.exceptions import ClientError
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+from base64 import b64decode
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+
+OUTPUT_LIMIT  = 35
+TIME_FROM_MIN = 15
+
+# The Slack channel to send a message to stored in the slackChannel environment variable
+TITLE = os.environ['title']
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+SENDER = boto3.client('kms').decrypt(CiphertextBlob=b64decode(os.environ['mailSender']))['Plaintext'].decode('utf-8')
+RECIPIENT = boto3.client('kms').decrypt(CiphertextBlob=b64decode(os.environ['mailRecipient']))['Plaintext'].decode('utf-8')
+
+# If necessary, replace us-west-2 with the AWS Region you're using for Amazon SES.
+AWS_REGION = "us-east-1"
+
+# The subject line for the email.
+SUBJECT = ""
+
+# The full path to the file that will be attached to the email.
+ATTACHMENT = os.environ['attachmentFile']
+
+# The email body for recipients with non-HTML email clients.
+BODY_TEXT = ""
+
+# The character encoding for the email.
+CHARSET = "utf-8"
+
+def lambda_handler(event, context):
+    
+    message = json.loads(event['Records'][0]['Sns']['Message'])
+    
+    logger.info("Message: " + str(message))
+    alarm_name = message['AlarmName']
+    new_state  = message['NewStateValue']
+    reason     = message['NewStateReason']
+    metric     = message['Trigger']['MetricName']
+    namespace  = message['Trigger']['Namespace']
+    state_changte_time = message['StateChangeTime'][:19]
+    
+    #ログストリームの抽出対象時刻をUNIXタイムに変換
+    #終了時刻はアラーム発生時刻の1分後
+    timeto = datetime.datetime.strptime(state_changte_time,'%Y-%m-%dT%H:%M:%S') + datetime.timedelta(minutes=1)
+    u_to = calendar.timegm(timeto.utctimetuple()) * 1000
+
+    #開始時刻は終了時刻のTIME_FROM_MIN分前
+    timefrom = timeto - datetime.timedelta(minutes=TIME_FROM_MIN)
+    u_from = calendar.timegm(timefrom.utctimetuple()) * 1000
+
+    logs = boto3.client('logs')
+
+    # メトリクスフィルタの取得
+    metricfilters = logs.describe_metric_filters(
+        metricName = metric,
+        metricNamespace = namespace
+    )
+
+    server_messages_log = logs.filter_log_events(
+        logGroupName = metricfilters['metricFilters'][0]['logGroupName'] ,
+        filterPattern = metricfilters['metricFilters'][0]['filterPattern'],
+        startTime = u_from,
+        endTime = u_to,
+        limit = OUTPUT_LIMIT
+    )
+    
+    SUBJECT = '[' + TITLE + 'CloudWatch Log Alarm] ' + str(metric)
+    BODY_TEXT = "%s state is now %s: %s \n %s" % (alarm_name, new_state, reason, SUBJECT)
+    text_message = 'LogMessages:' + json.dumps(server_messages_log['events'], ensure_ascii=False, indent=4, separators=(',', ': '))
+    
+    with open(ATTACHMENT, 'w') as write_file:
+        write_file.write(text_message)
+    
+    # Create a new SES resource and specify a region.
+    client = boto3.client('ses',region_name=AWS_REGION)
+    
+    # Create a multipart/mixed parent container.
+    msg = MIMEMultipart('mixed')
+    # Add subject, from and to lines.
+    msg['Subject'] = SUBJECT 
+    msg['From'] = SENDER 
+    msg['To'] = RECIPIENT
+    
+    # Create a multipart/alternative child container.
+    msg_body = MIMEMultipart('alternative')
+    
+    # Encode the text and HTML content and set the character encoding. This step is
+    # necessary if you're sending a message with characters outside the ASCII range.
+    textpart = MIMEText(BODY_TEXT.encode(CHARSET), 'plain', CHARSET)
+    
+    # Add the text and HTML parts to the child container.
+    msg_body.attach(textpart)
+    
+    # Define the attachment part and encode it using MIMEApplication.
+    
+    with open(ATTACHMENT, 'rb') as read_file:
+        att = MIMEApplication(read_file.read())
+    
+    # Add a header to tell the email client to treat this part as an attachment,
+    # and to give the attachment a name.
+    att.add_header('Content-Disposition','attachment',filename=os.path.basename(ATTACHMENT))
+    
+    # Attach the multipart/alternative child container to the multipart/mixed
+    # parent container.
+    msg.attach(msg_body)
+    
+    # Add the attachment to the parent container.
+    msg.attach(att)
+    
+    try:
+        #Provide the contents of the email.
+        response = client.send_raw_email(
+            Source=SENDER,
+            Destinations=[
+                RECIPIENT
+            ],
+            RawMessage={
+                'Data':msg.as_string(),
+            }
+        )
+        # テキストファイルを削除
+        os.remove(ATTACHMENT)
+    # Display an error if something goes wrong.	
+    except ClientError as e:
+        print(e.response['Error']['Message'])
+    else:
+        print("Email sent! Message ID:"),
+        print(response['MessageId'])
